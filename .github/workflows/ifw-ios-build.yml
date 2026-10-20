@@ -78,6 +78,15 @@ jobs:
           mkdir -p build/output/Payload
           cp -R "$APP_PATH" build/output/Payload/App.app
 
+          # Injection directe du Privacy Manifest dans le bundle racine
+          if [ -f "ios/App/App/PrivacyInfo.xcprivacy" ]; then
+            cp ios/App/App/PrivacyInfo.xcprivacy build/output/Payload/App.app/PrivacyInfo.xcprivacy
+            echo "PrivacyInfo.xcprivacy copié dans Payload/App.app/"
+          elif [ -f "ios-manifests/PrivacyInfo.xcprivacy" ]; then
+            cp ios-manifests/PrivacyInfo.xcprivacy build/output/Payload/App.app/PrivacyInfo.xcprivacy
+            echo "PrivacyInfo.xcprivacy copié depuis ios-manifests dans Payload/App.app/"
+          fi
+
           cd build/output
           zip -r ../IFW-Proof-unsigned.ipa Payload
           cd ../..
