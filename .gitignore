@@ -1,0 +1,11 @@
+node_modules/
+ios/App/Pods/
+ios/App/Podfile.lock
+ios/App/build/
+ios/App/*.xcworkspace/xcuserdata/
+ios/App/*.xcodeproj/xcuserdata/
+*.xcuserdata
+build/
+dist/
+.DS_Store
+Thumbs.db
