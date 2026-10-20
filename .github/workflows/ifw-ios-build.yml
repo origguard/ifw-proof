@@ -1,168 +1,93 @@
 name: IFW iOS Headless Build
 
 on:
+  push:
+    branches:
+      - main
   workflow_dispatch:
     inputs:
       release_tag:
-        description: 'Tag de release ou numéro de version'
+        description: 'Tag de release'
         required: false
         default: 'v1.0.0'
-  push:
-    branches: [ main, master ]
-    paths-ignore:
-      - '**.md'
-      - '.gitignore'
 
 jobs:
-  build-ios-ipa:
-    name: Build & Package iOS IPA (ad-hoc)
+  build-unsigned-ios:
+    name: Build Unsigned iOS IPA (macos-14)
     runs-on: macos-14
-    timeout-minutes: 45
+    timeout-minutes: 30
 
     steps:
-      - name: 1. Récupération du Code Source
+      - name: 1. Checkout repository
         uses: actions/checkout@v4
 
-      - name: 2. Initialisation de l'Environnement Node.js
+      - name: 2. Setup Node.js 20
         uses: actions/setup-node@v4
         with:
           node-version: 20
           cache: 'npm'
 
-      - name: 3. Installation des Dépendances du Projet
+      - name: 3. Install NPM dependencies (reproducible npm ci)
         run: |
-          npm ci --prefer-offline || npm install
+          npm ci
 
-      - name: 4. Build des Assets Web, Sync Capacitor & CocoaPods
+      - name: 4. Build web assets & sync Capacitor
         run: |
           npm run build --if-present
-          if [ -f "capacitor.config.json" ] || [ -f "capacitor.config.ts" ]; then
-            npx cap sync ios
-            
-            # Injection vérifiée de PrivacyInfo.xcprivacy dans le target iOS
-            if [ -f "ios-manifests/PrivacyInfo.xcprivacy" ] && [ -d "ios/App/App" ]; then
-              cp ios-manifests/PrivacyInfo.xcprivacy ios/App/App/PrivacyInfo.xcprivacy
-              echo "PrivacyInfo.xcprivacy synchronisé avec succès dans ios/App/App/."
-            fi
+          npx cap sync ios
 
-            # Résolution stricte CocoaPods
-            if [ -f "ios/App/Podfile" ]; then
-              echo "Installation des Pods iOS..."
-              cd ios/App
-              pod repo update || true
-              pod install --repo-update
-              cd ../..
-            fi
-          fi
-
-      - name: 5. Configuration du Trousseau d'Accès et des Certificats Apple
-        env:
-          BUILD_CERTIFICATE_BASE64: ${{ secrets.BUILD_CERTIFICATE_BASE64 }}
-          P12_PASSWORD: ${{ secrets.P12_PASSWORD }}
-          BUILD_PROVISION_PROFILE_BASE64: ${{ secrets.BUILD_PROVISION_PROFILE_BASE64 }}
-          KEYCHAIN_PASSWORD: ${{ secrets.KEYCHAIN_PASSWORD || 'ifw-temp-keychain-pass' }}
+      - name: 5. Lint PrivacyInfo.xcprivacy (Rail B Syntax Check)
         run: |
-          if [ -n "$BUILD_CERTIFICATE_BASE64" ]; then
-            echo "Importation du certificat de signature officiel (.p12)..."
-            CERTIFICATE_PATH=$RUNNER_TEMP/build_certificate.p12
-            PP_PATH=$RUNNER_TEMP/build_pp.mobileprovision
-            KEYCHAIN_PATH=$RUNNER_TEMP/app-signing.keychain-db
+          set -euo pipefail
+          echo "Vérification syntaxique Apple du Privacy Manifest..."
+          plutil -lint ios/App/App/PrivacyInfo.xcprivacy
 
-            echo -n "$BUILD_CERTIFICATE_BASE64" | base64 --decode -o $CERTIFICATE_PATH
-            echo -n "$BUILD_PROVISION_PROFILE_BASE64" | base64 --decode -o $PP_PATH
-
-            security create-keychain -p "$KEYCHAIN_PASSWORD" $KEYCHAIN_PATH
-            security set-keychain-settings -lut 21600 $KEYCHAIN_PATH
-            security unlock-keychain -p "$KEYCHAIN_PASSWORD" $KEYCHAIN_PATH
-
-            security import $CERTIFICATE_PATH -P "$P12_PASSWORD" -A -t cert -f pkcs12 -k $KEYCHAIN_PATH
-            security set-key-partition-list -S apple-tool:,apple: -s -k "$KEYCHAIN_PASSWORD" $KEYCHAIN_PATH
-            security list-keychain -d user -s $KEYCHAIN_PATH
-
-            mkdir -p ~/Library/MobileDevice/Provisioning\ Profiles
-            cp $PP_PATH ~/Library/MobileDevice/Provisioning\ Profiles/
-          else
-            echo "Aucun certificat .p12 configuré : Mode Étape 0 (Compilation Unsigned sans secret)."
-          fi
-
-      - name: 6. Génération de ExportOptions.plist
+      - name: 6. Resolve CocoaPods dependencies
         run: |
-          cat <<EOF > ExportOptions.plist
-          <?xml version="1.0" encoding="UTF-8"?>
-          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-          <plist version="1.0">
-          <dict>
-            <key>method</key>
-            <string>ad-hoc</string>
-            <key>signingStyle</key>
-            <string>automatic</string>
-            <key>stripSwiftSymbols</key>
-            <true/>
-            <key>compileBitcode</key>
-            <false/>
-          </dict>
-          </plist>
-          EOF
+          set -euo pipefail
+          cd ios/App
+          pod repo update || true
+          pod install --repo-update
+          cd ../..
 
-      - name: 7. Compilation Headless xcodebuild
-        env:
-          BUILD_CERTIFICATE_BASE64: ${{ secrets.BUILD_CERTIFICATE_BASE64 }}
+      - name: 7. Build unsigned iOS app via xcodebuild
         run: |
-          WORKSPACE="ios/App/App.xcworkspace"
-          PROJECT="ios/App/App.xcodeproj"
-          SCHEME="App"
-          mkdir -p build/output
+          set -euo pipefail
+          xcodebuild \
+            -workspace ios/App/App.xcworkspace \
+            -scheme App \
+            -configuration Release \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath ios/App/build/DerivedData \
+            CODE_SIGN_IDENTITY="" \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGNING_ALLOWED=NO \
+            build -quiet
 
-          if [ -d "$WORKSPACE" ]; then
-            TARGET_ARG="-workspace $WORKSPACE"
-          elif [ -d "$PROJECT" ]; then
-            TARGET_ARG="-project $PROJECT"
-          else
-            echo "Erreur : Aucun projet Xcode trouvé dans ios/App"
+      - name: 8. Package unsigned IPA container
+        run: |
+          set -euo pipefail
+          APP_PATH="ios/App/build/DerivedData/Build/Products/Release-iphoneos/App.app"
+          if [ ! -d "$APP_PATH" ]; then
+            echo "ERROR: App.app non trouvé à $APP_PATH"
+            find ios/App/build/DerivedData -maxdepth 6 -type d -name "*.app" || true
             exit 1
           fi
 
-          if [ -n "$BUILD_CERTIFICATE_BASE64" ]; then
-            echo "Mode Signé : Lancement de xcodebuild archive..."
-            xcodebuild $TARGET_ARG \
-              -scheme "$SCHEME" \
-              -configuration Release \
-              -archivePath build/App.xcarchive \
-              CODE_SIGN_STYLE=Automatic \
-              archive -quiet
+          echo "App.app localisé avec succès : $APP_PATH"
+          mkdir -p build/output/Payload
+          cp -R "$APP_PATH" build/output/Payload/App.app
 
-            echo "Export de l'archive vers le format IPA..."
-            xcodebuild -exportArchive \
-              -archivePath build/App.xcarchive \
-              -exportOptionsPlist ExportOptions.plist \
-              -exportPath build/output \
-              -quiet
-          else
-            echo "Mode Étape 0 Unsigned : Compilation du binaire iOS sans certificat..."
-            xcodebuild $TARGET_ARG \
-              -scheme "$SCHEME" \
-              -configuration Release \
-              -destination 'generic/platform=iOS' \
-              CODE_SIGN_IDENTITY="" \
-              CODE_SIGNING_REQUIRED=NO \
-              CODE_SIGNING_ALLOWED=NO \
-              build -quiet
+          cd build/output
+          zip -r ../IFW-Proof-unsigned.ipa Payload
+          cd ../..
+          echo "Archive IPA non signée produite : build/IFW-Proof-unsigned.ipa"
+          ls -lh build/IFW-Proof-unsigned.ipa
 
-            echo "Emballage du bundle .app non signé en conteneur IPA pour analyse..."
-            APP_PATH=$(find ~/Library/Developer/Xcode/DerivedData -name "App.app" -type d | head -n 1)
-            if [ -n "$APP_PATH" ] && [ -d "$APP_PATH" ]; then
-              mkdir -p build/output/Payload
-              cp -R "$APP_PATH" build/output/Payload/
-              cd build/output && zip -qr "IFW Proof-unsigned.ipa" Payload && cd ../..
-              echo "Artefact non signé produit avec succès : build/output/IFW Proof-unsigned.ipa"
-            else
-              echo "Avertissement : App.app non localisé dans DerivedData."
-            fi
-          fi
-
-      - name: 8. Archivage de l'Artefact .ipa pour Récupération Windows
+      - name: 9. Upload unsigned IPA artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ifw-ios-app-package
-          path: build/output/*.ipa
+          name: IFW-Proof-unsigned-ipa
+          path: build/IFW-Proof-unsigned.ipa
+          if-no-files-found: error
           retention-days: 7
